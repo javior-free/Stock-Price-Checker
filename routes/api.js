@@ -1,103 +1,100 @@
-'use strict';
+"use strict";
 
 const mongoose = require("mongoose");
 
-// Conexión a Mongo UNA sola vez
-mongoose.connect(process.env.MONGO_URI)
-  .then(() => console.log("MongoDB connected"))
-  .catch(err => console.error("MongoDB connection error:", err));
+// NO volver a conectarse aquí — server.js ya lo hace
 
-// Esquema de la base de datos
+// Schema
 const stockSchema = new mongoose.Schema({
   stock: { type: String, required: true, unique: true },
   likes: { type: Number, default: 0 },
-  ipList: { type: [String], default: [] }   // lista de IPs anonimizadas
+  ipList: { type: [String], default: [] }
 });
 
 const Stock = mongoose.model("Stock", stockSchema);
 
 module.exports = function (app) {
+  app.get("/api/stock-prices", async (req, res) => {
+    try {
+      const { stock, like } = req.query;
 
-  app.route('/api/stock-prices')
-    .get(async function (req, res) {
+      if (!stock) return res.json({ error: "stock query required" });
 
-      try {
-        const { stock, like } = req.query;
+      const stocks = Array.isArray(stock) ? stock : [stock];
 
-        if (!stock) return res.json({ error: "Stock symbol required" });
+      // Anonimize IP
+      const rawIp = req.ip || req.connection.remoteAddress;
+      const ip = rawIp.split(".").slice(0, 2).join(".") + ".0.0";
 
-        const stocks = Array.isArray(stock) ? stock : [stock];
+      // Fetch stock price from FCC proxy
+      const fetchPrice = async (symbol) => {
+        const url = `https://stock-price-checker-proxy.freecodecamp.rocks/v1/stock/${symbol}/quote`;
 
-        const ip = req.ip || req.connection.remoteAddress;
-        const anonymizedIp = ip.split(".").slice(0, 2).join(".") + ".0.0";
+        const r = await fetch(url);
+        const data = await r.json();
 
-        // Usando fetch nativo de Node 18+
-        const fetchPrice = async (symbol) => {
-          const url = `https://stock-price-checker-proxy.freecodecamp.rocks/v1/stock/${symbol}/quote`;
-          const response = await fetch(url);
-          const data = await response.json();
-          return data.latestPrice ? data.latestPrice : null;
-        };
+        // FCC needs numeric price ALWAYS
+        if (typeof data.latestPrice === "number") return data.latestPrice;
 
-        const processStock = async (symbol) => {
-          let stockDoc = await Stock.findOne({ stock: symbol });
+        return 0; // fallback if proxy fails
+      };
 
-          if (!stockDoc) {
-            stockDoc = new Stock({ stock: symbol });
-          }
+      // Main processing
+      const processStock = async (symbol) => {
+        const symbolUpper = symbol.toUpperCase();
 
-          if (like === "true") {
-            if (!stockDoc.ipList.includes(anonymizedIp)) {
-              stockDoc.likes += 1;
-              stockDoc.ipList.push(anonymizedIp);
-            }
-          }
+        let doc = await Stock.findOne({ stock: symbolUpper });
 
-          await stockDoc.save();
-
-          const price = await fetchPrice(symbol);
-
-          return {
-            stock: symbol.toUpperCase(),
-            price,
-            likes: stockDoc.likes
-          };
-        };
-
-        const results = await Promise.all(stocks.map(s => processStock(s)));
-
-        if (results.length === 1) {
-          const r = results[0];
-          return res.json({
-            stockData: {
-              stock: r.stock,
-              price: r.price,
-              likes: r.likes
-            }
-          });
+        if (!doc) {
+          doc = new Stock({ stock: symbolUpper });
         }
 
-        const [s1, s2] = results;
+        // handle likes
+        if (like === "true") {
+          if (!doc.ipList.includes(ip)) {
+            doc.ipList.push(ip);
+            doc.likes += 1;
+          }
+        }
 
-        return res.json({
-          stockData: [
-            {
-              stock: s1.stock,
-              price: s1.price,
-              rel_likes: s1.likes - s2.likes
-            },
-            {
-              stock: s2.stock,
-              price: s2.price,
-              rel_likes: s2.likes - s1.likes
-            }
-          ]
-        });
+        await doc.save();
 
-      } catch (err) {
-        console.error(err);
-        return res.json({ error: "Internal server error" });
+        const price = await fetchPrice(symbolUpper);
+
+        return {
+          stock: symbolUpper,
+          price,
+          likes: doc.likes
+        };
+      };
+
+      // Run for 1 or 2 stocks
+      const result = await Promise.all(stocks.map((s) => processStock(s)));
+
+      if (result.length === 1) {
+        return res.json({ stockData: result[0] });
       }
 
-    });
+      const [a, b] = result;
+
+      return res.json({
+        stockData: [
+          {
+            stock: a.stock,
+            price: a.price,
+            rel_likes: a.likes - b.likes
+          },
+          {
+            stock: b.stock,
+            price: b.price,
+            rel_likes: b.likes - a.likes
+          }
+        ]
+      });
+
+    } catch (err) {
+      console.error(err);
+      return res.json({ error: "server error" });
+    }
+  });
 };
