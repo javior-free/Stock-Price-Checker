@@ -26,7 +26,7 @@ mongoose.connect(process.env.MONGO_URI, {
 
 app.use('/public', express.static(process.cwd() + '/public'));
 
-app.use(cors(/*{origin: '*'}*/)); // FCC requirement
+app.use(cors({origin: '*'})); // FCC requirement
 
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
