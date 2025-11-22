@@ -1,100 +1,112 @@
-"use strict";
+'use strict';
 
 const mongoose = require("mongoose");
+const fetch = require("node-fetch");
 
-// NO volver a conectarse aquí — server.js ya lo hace
+// Conexión a Mongo UNA sola vez
+mongoose.connect(process.env.MONGO_URI)
+  .then(() => console.log("MongoDB connected"))
+  .catch(err => console.error("MongoDB connection error:", err));
 
-// Schema
+// Esquema de la base de datos
 const stockSchema = new mongoose.Schema({
   stock: { type: String, required: true, unique: true },
   likes: { type: Number, default: 0 },
-  ipList: { type: [String], default: [] }
+  ipList: { type: [String], default: [] }   // lista de IPs anonimizadas
 });
 
 const Stock = mongoose.model("Stock", stockSchema);
 
 module.exports = function (app) {
-  app.get("/api/stock-prices", async (req, res) => {
-    try {
-      const { stock, like } = req.query;
 
-      if (!stock) return res.json({ error: "stock query required" });
+  app.route('/api/stock-prices')
+    .get(async function (req, res) {
 
-      const stocks = Array.isArray(stock) ? stock : [stock];
+      try {
+        const { stock, like } = req.query;
 
-      // Anonimize IP
-      const rawIp = req.ip || req.connection.remoteAddress;
-      const ip = rawIp.split(".").slice(0, 2).join(".") + ".0.0";
+        // Validación básica
+        if (!stock) return res.json({ error: "Stock symbol required" });
 
-      // Fetch stock price from FCC proxy
-      const fetchPrice = async (symbol) => {
-        const url = `https://stock-price-checker-proxy.freecodecamp.rocks/v1/stock/${symbol}/quote`;
+        // Si viene un solo stock, convertirlo en array
+        const stocks = Array.isArray(stock) ? stock : [stock];
 
-        const r = await fetch(url);
-        const data = await r.json();
+        // IP anonimizanda para FCC (solo 2 primeros octetos)
+        const ip = req.ip || req.connection.remoteAddress;
+        const anonymizedIp = ip.split(".").slice(0, 2).join(".") + ".0.0";
 
-        // FCC needs numeric price ALWAYS
-        if (typeof data.latestPrice === "number") return data.latestPrice;
-
-        return 0; // fallback if proxy fails
-      };
-
-      // Main processing
-      const processStock = async (symbol) => {
-        const symbolUpper = symbol.toUpperCase();
-
-        let doc = await Stock.findOne({ stock: symbolUpper });
-
-        if (!doc) {
-          doc = new Stock({ stock: symbolUpper });
-        }
-
-        // handle likes
-        if (like === "true") {
-          if (!doc.ipList.includes(ip)) {
-            doc.ipList.push(ip);
-            doc.likes += 1;
-          }
-        }
-
-        await doc.save();
-
-        const price = await fetchPrice(symbolUpper);
-
-        return {
-          stock: symbolUpper,
-          price,
-          likes: doc.likes
+        // Función para consultar el precio en el proxy
+        const fetchPrice = async (symbol) => {
+          const url = `https://stock-price-checker-proxy.freecodecamp.rocks/v1/stock/${symbol}/quote`;
+          const response = await fetch(url);
+          const data = await response.json();
+          return data.latestPrice ? data.latestPrice : null;
         };
-      };
 
-      // Run for 1 or 2 stocks
-      const result = await Promise.all(stocks.map((s) => processStock(s)));
+        // Procesador de un stock
+        const processStock = async (symbol) => {
+          let stockDoc = await Stock.findOne({ stock: symbol });
 
-      if (result.length === 1) {
-        return res.json({ stockData: result[0] });
+          if (!stockDoc) {
+            stockDoc = new Stock({ stock: symbol });
+          }
+
+          // Manejo del like
+          if (like === "true") {
+            if (!stockDoc.ipList.includes(anonymizedIp)) {
+              stockDoc.likes += 1;
+              stockDoc.ipList.push(anonymizedIp);
+            }
+          }
+
+          await stockDoc.save();
+
+          const price = await fetchPrice(symbol);
+
+          return {
+            stock: symbol.toUpperCase(),
+            price,
+            likes: stockDoc.likes
+          };
+        };
+
+        // Procesar todos los stocks (1 o 2)
+        const results = await Promise.all(stocks.map(s => processStock(s)));
+
+        // Si es una sola acción → respuesta simple
+        if (results.length === 1) {
+          const r = results[0];
+          return res.json({
+            stockData: {
+              stock: r.stock,
+              price: r.price,
+              likes: r.likes
+            }
+          });
+        }
+
+        // Si son dos acciones → agregar rel_likes
+        const [s1, s2] = results;
+
+        return res.json({
+          stockData: [
+            {
+              stock: s1.stock,
+              price: s1.price,
+              rel_likes: s1.likes - s2.likes
+            },
+            {
+              stock: s2.stock,
+              price: s2.price,
+              rel_likes: s2.likes - s1.likes
+            }
+          ]
+        });
+
+      } catch (err) {
+        console.error(err);
+        return res.json({ error: "Internal server error" });
       }
 
-      const [a, b] = result;
-
-      return res.json({
-        stockData: [
-          {
-            stock: a.stock,
-            price: a.price,
-            rel_likes: a.likes - b.likes
-          },
-          {
-            stock: b.stock,
-            price: b.price,
-            rel_likes: b.likes - a.likes
-          }
-        ]
-      });
-
-    } catch (err) {
-      console.error(err);
-      return res.json({ error: "server error" });
-    }
-  });
+    });
 };
